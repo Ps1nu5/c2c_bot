@@ -18,6 +18,8 @@ class Settings(Base):
     min_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     max_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    notify_taken: Mapped[bool] = mapped_column(Boolean, default=True)
+    chat_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class OrderLog(Base):

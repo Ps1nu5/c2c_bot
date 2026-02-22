@@ -57,7 +57,7 @@ async def bot_stop(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "bot:no_settings")
 async def bot_no_settings(callback: CallbackQuery) -> None:
     await callback.answer(
-        "Сначала заполните настройки фильтров (логин и пароль).",
+        "Сначала заполните данные для входа в настройках.",
         show_alert=True,
     )
 

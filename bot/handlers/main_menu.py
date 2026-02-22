@@ -27,15 +27,23 @@ async def cmd_start(message: Message) -> None:
         filter_parts.append(f"от {settings.min_amount:,.0f}")
     if settings.max_amount is not None:
         filter_parts.append(f"до {settings.max_amount:,.0f}")
-    filter_line = f"Фильтр суммы: {' '.join(filter_parts)} RUB" if filter_parts else "Фильтр суммы: не задан"
+    filter_line = (
+        f"Фильтр суммы: {' '.join(filter_parts)} ₽"
+        if filter_parts
+        else "Фильтр суммы: не задан"
+    )
+
+    notify_line = (
+        "Уведомления о взятых ордерах: ВКЛ"
+        if settings.notify_taken
+        else "Уведомления о взятых ордерах: ВЫКЛ"
+    )
 
     text = (
         f"Cards2cards бот\n\n"
         f"{status_line}\n"
-        f"{filter_line}"
+        f"{filter_line}\n"
+        f"{notify_line}"
     )
 
-    await message.answer(
-        text,
-        reply_markup=main_menu_keyboard(is_running, has_credentials),
-    )
+    await message.answer(text, reply_markup=main_menu_keyboard(is_running, has_credentials))
