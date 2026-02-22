@@ -4,7 +4,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Set
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -86,23 +86,43 @@ def _build_orders_url() -> str:
     return f"{ORDERS_BASE_URL}?from={from_str}&status=new&t={t}"
 
 
+def _parse_amount_title(title: str) -> Optional[float]:
+    """Parse amount strings like 'RUB -10,000.00' or 'RUB 1 500,50'.
+
+    US format:    comma=thousands, dot=decimal  e.g. "RUB -10,000.00" -> 10000.0
+    EU/RU format: dot/space=thousands, comma=decimal  e.g. "RUB 1 500,50" -> 1500.5
+    """
+    numeric = re.sub(r"[^\d,. ]", "", title).strip()
+    if not numeric:
+        return None
+    last_comma = numeric.rfind(",")
+    last_dot   = numeric.rfind(".")
+    if last_dot > last_comma:
+        # US format: remove comma thousands separators, keep dot as decimal
+        numeric = numeric.replace(",", "").replace(" ", "")
+    else:
+        # EU/RU format: remove dot/space thousands separators, comma becomes decimal
+        numeric = numeric.replace(".", "").replace(" ", "").replace(",", ".")
+    try:
+        return abs(float(numeric))
+    except ValueError:
+        return None
+
+
 def _extract_amount(row) -> Optional[float]:
     try:
         cells = row.find_elements(By.CSS_SELECTOR, "div[role='cell']")
         for cell in cells:
             title = cell.get_attribute("title") or ""
             if "RUB" in title:
-                cleaned = title.replace(",", ".").replace(" ", "").replace(" ", "")
-                import re as _re
-                cleaned = _re.sub(r"[^\d.]", "", cleaned)
-                parts = cleaned.split(".")
-                cleaned = parts[0] if len(parts) > 2 else cleaned
-                return abs(float(cleaned)) if cleaned else None
-        amount_div = row.find_element(By.CSS_SELECTOR, "div[title]")
-        title = amount_div.get_attribute("title") or ""
-        import re as _re
-        cleaned = _re.sub(r"[^\d.,]", "", title).replace(",", ".").replace(" ", "").replace(" ", "")
-        return abs(float(cleaned)) if cleaned else None
+                return _parse_amount_title(title)
+        for div in row.find_elements(By.CSS_SELECTOR, "div[title]"):
+            title = div.get_attribute("title") or ""
+            if title.strip():
+                result = _parse_amount_title(title)
+                if result is not None:
+                    return result
+        return None
     except (NoSuchElementException, ValueError):
         return None
 
@@ -136,6 +156,7 @@ class SeleniumWorker:
         self.password: str = ""
         self.min_amount: Optional[float] = None
         self.max_amount: Optional[float] = None
+        self._processed_slugs: Set[str] = set()
 
     def start(self, login: str, password: str, min_amount: Optional[float], max_amount: Optional[float]) -> None:
         if self._thread and self._thread.is_alive():
@@ -433,7 +454,11 @@ class SeleniumWorker:
         for row in rows:
             if self._stop_event.is_set():
                 return
-            self._process_row(row)
+            taken = self._process_row(row)
+            if taken:
+                # Order was just taken — stop iterating (row list may be stale after
+                # modal close / React re-render) and let the next poll cycle refresh.
+                break
 
     def _get_order_rows(self) -> list:
         try:
@@ -445,33 +470,105 @@ class SeleniumWorker:
         except WebDriverException:
             return []
 
-    def _process_row(self, row) -> None:
+    def _amount_in_range(self, amount: Optional[float]) -> bool:
+        """Return True if amount satisfies the configured min/max filter."""
+        if self.min_amount is None and self.max_amount is None:
+            return True
+        if amount is None:
+            # Can't read amount — skip to be safe
+            return False
+        if self.min_amount is not None and amount < self.min_amount:
+            return False
+        if self.max_amount is not None and amount > self.max_amount:
+            return False
+        return True
+
+    def _process_row(self, row) -> bool:
+        """Process a single order row.
+
+        The "Взять"/"Take" button is in a modal that opens when the row is clicked.
+        We click the row anchor (React Router shows the modal without full navigation),
+        find the button inside the modal, click it, accept the confirm dialog, then
+        close the modal by pressing Escape — staying on the orders page throughout.
+
+        Returns True after a successful take (so the poll loop refreshes the row list),
+        False if the row was skipped or an error occurred without navigation.
+        """
         slug = None
         amount = None
         try:
             slug = _extract_slug(row)
             amount = _extract_amount(row)
+
             if slug is None:
-                return
-            take_buttons = row.find_elements(*SEL_TAKE_BUTTON)
-            if not take_buttons:
-                return
-            take_btn = take_buttons[0]
-            if not take_btn.is_displayed() or not take_btn.is_enabled():
-                return
-            logger.info("Taking order %s amount=%s", slug, amount)
+                return False
+
+            if slug in self._processed_slugs:
+                return False
+
+            # Local amount guard — the UI filter may be reset after previous interactions
+            if not self._amount_in_range(amount):
+                logger.debug("Order %s amount=%s outside configured range, skipping", slug, amount)
+                return False
+
+            # Click the full-row anchor — React Router opens the order modal
+            try:
+                anchor = row.find_element(By.CSS_SELECTOR, "a[href*='/trader/orders/']")
+            except NoSuchElementException:
+                logger.warning("No anchor in row for slug %s", slug)
+                return False
+
+            logger.info("Opening modal for order %s amount=%s", slug, amount)
+            self._driver.execute_script("arguments[0].click();", anchor)
+            time.sleep(1.0)  # wait for modal open animation
+
+            # Find "Взять"/"Take" button inside the modal (global search, any Russian/English variant)
+            take_xpath = (
+                "//button["
+                "normalize-space(.)='Взять' or "
+                "normalize-space(.)='Take' or "
+                "normalize-space(.)='Принять' or "
+                "normalize-space(.)='Accept' or "
+                "normalize-space(.)='Взять ордер'"
+                "]"
+            )
+            try:
+                take_btn = self._wait(10).until(
+                    EC.element_to_be_clickable((By.XPATH, take_xpath))
+                )
+            except TimeoutException:
+                logger.warning("No Take button in modal for %s — already taken or not available", slug)
+                self._processed_slugs.add(slug)
+                # Close modal with Escape and stay on orders page
+                from selenium.webdriver.common.keys import Keys
+                self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                time.sleep(0.5)
+                return False
+
+            logger.info("Clicking Take button for order %s", slug)
             self._driver.execute_script("arguments[0].click();", take_btn)
             self._confirm_alert()
-            logger.info("Order %s taken successfully", slug)
+
+            logger.info("Order %s taken successfully (amount=%s)", slug, amount)
+            self._processed_slugs.add(slug)
             self._on_order_taken(slug, amount)
+            # After taking, the modal closes automatically; wait briefly then refresh
+            time.sleep(0.5)
+            return True
+
         except NoAlertPresentException:
-            logger.warning("No alert after Take for order %s", slug)
+            logger.warning("No confirm dialog for order %s", slug)
+            if slug:
+                self._processed_slugs.add(slug)
             self._on_order_failed(slug or "unknown", amount)
+            return False
         except StaleElementReferenceException:
             logger.debug("Stale element for order %s, skipping", slug)
+            return False
         except WebDriverException as exc:
             logger.error("WebDriverException taking order %s: %s", slug, exc)
             self._on_order_failed(slug or "unknown", amount)
+            return False
 
     def _confirm_alert(self) -> None:
         end_time = time.time() + ALERT_WAIT_TIMEOUT
