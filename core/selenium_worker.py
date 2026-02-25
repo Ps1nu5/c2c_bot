@@ -1,10 +1,12 @@
+import glob
 import logging
+import os
 import re
 import threading
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional, Set
+from typing import Callable, List, Optional, Set
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -23,11 +25,9 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 from config import (
     ALERT_WAIT_TIMEOUT,
     ELEMENT_WAIT_TIMEOUT,
-    LOGIN_URL,
     ORDERS_BASE_URL,
     PAGE_LOAD_TIMEOUT,
     POLL_INTERVAL,
-    TRADER_URL,
 )
 
 logger = logging.getLogger(__name__)
@@ -183,14 +183,75 @@ class SeleniumWorker:
     def _run(self) -> None:
         try:
             self._driver = self._create_driver()
-            self._login()
-            self._navigate_to_orders()
+            self._navigate_to_orders()   # handles login internally if needed
             self._apply_amount_filter()
             self._poll_loop()
         except Exception as exc:
             logger.exception("Worker crashed: %s", exc)
         finally:
             self._quit_driver()
+
+    @staticmethod
+    def _find_geckodriver() -> Optional[str]:
+        """Return path to geckodriver without relying on Selenium Manager network calls."""
+        candidates: List[str] = []
+
+        # 1. Next to this project (manually placed or previously downloaded)
+        project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates.append(os.path.join(project_dir, "geckodriver.exe"))
+        candidates.append(os.path.join(project_dir, "geckodriver"))
+
+        # 2. Selenium Manager cache (~/.cache/selenium/geckodriver/...)
+        sm_cache = os.path.join(os.path.expanduser("~"), ".cache", "selenium", "geckodriver")
+        if os.path.isdir(sm_cache):
+            for found in glob.glob(os.path.join(sm_cache, "**", "geckodriver.exe"), recursive=True):
+                candidates.append(found)
+            for found in glob.glob(os.path.join(sm_cache, "**", "geckodriver"), recursive=True):
+                candidates.append(found)
+
+        # 3. System PATH
+        import shutil
+        in_path = shutil.which("geckodriver")
+        if in_path:
+            candidates.append(in_path)
+
+        for path in candidates:
+            if os.path.isfile(path):
+                logger.info("Found geckodriver at: %s", path)
+                return path
+
+        return None
+
+    @staticmethod
+    def _find_firefox_binary() -> Optional[str]:
+        """Return path to Firefox binary (prefer Selenium Manager cache over system)."""
+        candidates: List[str] = []
+
+        # Selenium Manager cache
+        sm_cache = os.path.join(os.path.expanduser("~"), ".cache", "selenium", "firefox")
+        if os.path.isdir(sm_cache):
+            for found in glob.glob(os.path.join(sm_cache, "**", "firefox.exe"), recursive=True):
+                candidates.append(found)
+            for found in glob.glob(os.path.join(sm_cache, "**", "firefox"), recursive=True):
+                if not found.endswith(".sig"):
+                    candidates.append(found)
+
+        # Standard Windows installation paths
+        for prog in [os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", "")]:
+            if prog:
+                candidates.append(os.path.join(prog, "Mozilla Firefox", "firefox.exe"))
+
+        import shutil
+        in_path = shutil.which("firefox")
+        if in_path:
+            candidates.append(in_path)
+
+        for path in candidates:
+            if os.path.isfile(path):
+                logger.info("Found Firefox at: %s", path)
+                return path
+
+        return None
 
     def _create_driver(self) -> webdriver.Firefox:
         options = Options()
@@ -200,11 +261,28 @@ class SeleniumWorker:
         options.add_argument("--height=1080")
         options.set_preference("dom.webdriver.enabled", False)
         options.set_preference("useAutomationExtension", False)
-        try:
+
+        gecko = self._find_geckodriver()
+        firefox_bin = self._find_firefox_binary()
+
+        if firefox_bin:
+            options.binary_location = firefox_bin
+
+        if gecko:
+            # Use explicit paths — completely bypasses Selenium Manager network calls
+            service = Service(executable_path=gecko)
+            logger.info("Starting Firefox with explicit geckodriver (no Selenium Manager)")
+        else:
+            # Fallback: let Selenium Manager handle it (may require network)
+            logger.warning("geckodriver not found locally, falling back to Selenium Manager")
             service = Service()
+
+        try:
             driver = webdriver.Firefox(service=service, options=options)
-        except Exception:
+        except Exception as exc:
+            logger.warning("First driver init attempt failed (%s), retrying without service", exc)
             driver = webdriver.Firefox(options=options)
+
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.implicitly_wait(0)
         return driver
@@ -213,29 +291,84 @@ class SeleniumWorker:
         return WebDriverWait(self._driver, timeout)
 
     def _login(self) -> None:
-        logger.info("Navigating to login page")
-        self._driver.get(LOGIN_URL)
-        email_input = self._wait().until(EC.presence_of_element_located(SEL_EMAIL_INPUT))
+        """Fill in and submit the login form on the CURRENT page.
+
+        Assumes the browser is already showing the login page.
+        Waits for the URL to leave /login after submit.
+        """
+        logger.info("Filling login form at: %s", self._driver.current_url)
+        # Brief pause so React can attach its event handlers to the form
+        time.sleep(0.8)
+        # Use element_to_be_clickable so we know the field is interactive
+        email_input = self._wait().until(EC.element_to_be_clickable(SEL_EMAIL_INPUT))
+        email_input.click()
         email_input.clear()
         email_input.send_keys(self.login)
-        password_input = self._driver.find_element(*SEL_PASSWORD_INPUT)
+        logger.info("Email entered")
+        password_input = self._wait(5).until(EC.element_to_be_clickable(SEL_PASSWORD_INPUT))
+        password_input.click()
         password_input.clear()
         password_input.send_keys(self.password)
-        submit = self._driver.find_element(*SEL_SUBMIT_BUTTON)
+        logger.info("Password entered, clicking submit")
+        submit = self._wait(5).until(EC.element_to_be_clickable(SEL_SUBMIT_BUTTON))
         submit.click()
         self._wait(PAGE_LOAD_TIMEOUT).until(
-            lambda d: d.current_url != LOGIN_URL and "/login" not in d.current_url
+            lambda d: "/login" not in d.current_url
         )
-        logger.info("Login successful, current url: %s", self._driver.current_url)
+        logger.info("Login successful → now at: %s", self._driver.current_url)
+        time.sleep(1.5)  # let React auth context finish initialising
+
+    def _is_on_login_page(self) -> bool:
+        try:
+            return "/login" in self._driver.current_url
+        except Exception:
+            return False
 
     def _navigate_to_orders(self) -> None:
-        logger.info("Navigating to trader role page")
-        self._driver.get(TRADER_URL)
-        self._wait_page_ready()
+        """Navigate the browser to the orders page, logging in along the way if needed.
+
+        Flow:
+          1. Navigate directly to the orders URL.
+          2. If the site redirects to /login (React Router auth check or server redirect),
+             fill in credentials on that login page.
+          3. After successful login the session is established — navigate explicitly to
+             the orders URL again (more reliable than depending on the site's ?redirect=
+             mechanism which may have double-encoded params).
+          4. Wait for the orders table to render.
+        """
         self._orders_url = _build_orders_url()
         logger.info("Navigating to orders: %s", self._orders_url)
         self._driver.get(self._orders_url)
+        # Give React Router a moment to evaluate the auth state and redirect if needed
+        time.sleep(0.8)
+
+        if self._is_on_login_page():
+            logger.info("Redirected to login — authenticating")
+            self._login()
+            # Session is now established; navigate to orders explicitly
+            # (don't rely on the site's ?redirect= param which may be double-encoded)
+            if not self._is_on_login_page():
+                logger.info("Login succeeded — navigating to orders explicitly")
+                self._driver.get(self._orders_url)
+                time.sleep(0.8)
+
+        if self._is_on_login_page():
+            raise RuntimeError(
+                "Still on login page after authentication attempt — check credentials"
+            )
+
         self._wait_for_table()
+        logger.info("Orders page loaded: %s", self._driver.current_url)
+
+    def _re_authenticate(self) -> None:
+        """Re-navigate to the orders page, logging in if the session has expired."""
+        logger.warning("Session expired — re-authenticating")
+        try:
+            self._navigate_to_orders()
+            self._apply_amount_filter()
+            logger.info("Re-authentication successful")
+        except Exception as exc:
+            logger.error("Re-authentication failed: %s", exc)
 
     def _apply_amount_filter(self) -> None:
         logger.info(
@@ -440,6 +573,13 @@ class SeleniumWorker:
             self._stop_event.wait(POLL_INTERVAL)
 
     def _poll_once(self) -> None:
+        # --- Detect session expiry before doing anything ---
+        if self._is_on_login_page():
+            logger.warning("Session expired (on login page), re-authenticating")
+            self._re_authenticate()
+            return
+
+        # --- Refresh table ---
         try:
             refresh_btn = self._wait(5).until(EC.element_to_be_clickable(SEL_REFRESH_BUTTON))
             self._driver.execute_script("arguments[0].click();", refresh_btn)
@@ -447,6 +587,13 @@ class SeleniumWorker:
         except (NoSuchElementException, TimeoutException):
             logger.debug("Refresh button not found, falling back to driver.get")
             self._driver.get(self._orders_url)
+
+        # --- Detect session expiry after refresh (refresh may redirect to login) ---
+        if self._is_on_login_page():
+            logger.warning("Session expired after refresh, re-authenticating")
+            self._re_authenticate()
+            return
+
         self._wait_for_table()
         rows = self._get_order_rows()
         if not rows:
@@ -590,6 +737,10 @@ class SeleniumWorker:
             pass
         # Wait for table container AND at least one row OR empty state indicator
         for _ in range(40):
+            # Short-circuit if session expired mid-wait
+            if self._is_on_login_page():
+                logger.warning("Redirected to login while waiting for table")
+                return
             try:
                 body = self._driver.find_element(*SEL_TABLE_BODY)
                 # Check: rows rendered OR loading spinner gone
