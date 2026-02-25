@@ -20,6 +20,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 from config import (
@@ -48,11 +49,10 @@ SEL_FILTER_BUTTON  = (By.XPATH,
     ")]]"
 )
 
-# Refresh button — there are two eihCyf buttons: search (magnifier) and refresh (circular arrow).
-# The refresh icon path starts with M12.794 (circular arrow).
+# Refresh button — identified by the circular-arrow SVG icon path (M12.794...).
+# We do NOT match by class since styled-components class names change on every site deploy.
 SEL_REFRESH_BUTTON = (By.XPATH,
-    "//button[contains(@class,'eihCyf') and "
-    ".//*[local-name()='path' and contains(@d,'M12.794')]]"
+    "//button[.//*[local-name()='path' and contains(@d,'M12.794')]]"
 )
 
 # Amount checkbox: the ljCEoY class is shared across ALL filter rows (Date, Status, Amount, etc.)
@@ -143,10 +143,12 @@ class SeleniumWorker:
         self,
         on_order_taken: Callable[[str, Optional[float]], None],
         on_order_failed: Callable[[str, Optional[float]], None],
+        on_startup_ok: Optional[Callable[[Optional[float], Optional[float]], None]] = None,
         headless: bool = True,
     ) -> None:
         self._on_order_taken = on_order_taken
         self._on_order_failed = on_order_failed
+        self._on_startup_ok = on_startup_ok
         self._headless = headless
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -157,6 +159,9 @@ class SeleniumWorker:
         self.min_amount: Optional[float] = None
         self.max_amount: Optional[float] = None
         self._processed_slugs: Set[str] = set()
+        # True when amount filter is currently active in the browser UI.
+        # Cleared whenever a full page reload wipes React state.
+        self._filter_applied: bool = False
 
     def start(self, login: str, password: str, min_amount: Optional[float], max_amount: Optional[float]) -> None:
         if self._thread and self._thread.is_alive():
@@ -185,6 +190,12 @@ class SeleniumWorker:
             self._driver = self._create_driver()
             self._navigate_to_orders()   # handles login internally if needed
             self._apply_amount_filter()
+            # One-time startup notification (only fires here, not on re-auth cycles)
+            if self._on_startup_ok:
+                try:
+                    self._on_startup_ok(self.min_amount, self.max_amount)
+                except Exception as exc:
+                    logger.warning("Startup notification failed: %s", exc)
             self._poll_loop()
         except Exception as exc:
             logger.exception("Worker crashed: %s", exc)
@@ -324,6 +335,51 @@ class SeleniumWorker:
         except Exception:
             return False
 
+    def _is_error_page(self) -> bool:
+        """Detect React error boundary or server-side crash page.
+
+        These pages typically contain phrases like "Возникла проблема",
+        "Something went wrong", or a visible error stack trace.
+        We check the visible text (innerText) rather than innerHTML to avoid
+        false positives from hidden/template HTML.
+        """
+        try:
+            text = self._driver.execute_script(
+                "return document.body ? document.body.innerText : ''"
+            ) or ""
+            markers = [
+                # Russian error boundary phrases
+                "возникла проблема", "произошла ошибка", "что-то пошло не так",
+                "попробуйте обновить",
+                # English error boundary / server error phrases
+                "something went wrong", "an error occurred",
+                "there was a problem",   # "Sorry there was a problem loading this page"
+                "problem loading",
+                "try refreshing",
+                "unexpected error", "application error",
+            ]
+            tl = text.lower()
+            return any(m in tl for m in markers)
+        except Exception:
+            return False
+
+    def _recover_from_error_page(self) -> None:
+        """Navigate back to orders URL to recover from a crash/error page."""
+        logger.warning("Recovering from error page — navigating to orders")
+        try:
+            self._filter_applied = False
+            self._driver.get(self._orders_url)
+            time.sleep(0.8)
+            if self._is_on_login_page():
+                self._re_authenticate()
+                return
+            self._wait_for_table()
+            if self.min_amount is not None or self.max_amount is not None:
+                self._apply_amount_filter()
+            logger.info("Recovered from error page successfully")
+        except Exception as exc:
+            logger.error("Recovery from error page failed: %s", exc)
+
     def _navigate_to_orders(self) -> None:
         """Navigate the browser to the orders page, logging in along the way if needed.
 
@@ -337,6 +393,7 @@ class SeleniumWorker:
           4. Wait for the orders table to render.
         """
         self._orders_url = _build_orders_url()
+        self._filter_applied = False   # full navigation wipes React state
         logger.info("Navigating to orders: %s", self._orders_url)
         self._driver.get(self._orders_url)
         # Give React Router a moment to evaluate the auth state and redirect if needed
@@ -345,12 +402,21 @@ class SeleniumWorker:
         if self._is_on_login_page():
             logger.info("Redirected to login — authenticating")
             self._login()
-            # Session is now established; navigate to orders explicitly
-            # (don't rely on the site's ?redirect= param which may be double-encoded)
-            if not self._is_on_login_page():
-                logger.info("Login succeeded — navigating to orders explicitly")
+            # After login the site uses its own ?redirect= param to send us back.
+            # Only navigate explicitly if we ended up somewhere OTHER than orders
+            # (e.g. the redirect param was missing/broken and we landed on /trader).
+            # Never do an extra driver.get() when already on the orders page — that
+            # would trigger yet another full reload and lose the auth state again.
+            current_url = self._driver.current_url
+            if not self._is_on_login_page() and "/trader/orders" not in current_url:
+                logger.info(
+                    "Login succeeded but landed on %s — navigating to orders explicitly",
+                    current_url,
+                )
                 self._driver.get(self._orders_url)
-                time.sleep(0.8)
+                time.sleep(1.0)
+            else:
+                logger.info("Login succeeded and already on orders page — skipping extra navigation")
 
         if self._is_on_login_page():
             raise RuntimeError(
@@ -377,6 +443,7 @@ class SeleniumWorker:
         )
         if self.min_amount is None and self.max_amount is None:
             logger.info("No amount filter configured, skipping")
+            self._filter_applied = True   # nothing to apply = filter is "done"
             return
 
         logger.info("Applying amount filter: min=%s max=%s", self.min_amount, self.max_amount)
@@ -491,9 +558,11 @@ class SeleniumWorker:
             self._driver.execute_script("arguments[0].click();", submit_btn)
             time.sleep(0.5)
             self._wait_for_table()
+            self._filter_applied = True
             logger.info("Filter applied successfully")
         except TimeoutException:
-            logger.warning("Filter submit button not found")
+            self._filter_applied = False
+            logger.warning("Filter submit button not found — filter NOT applied")
 
     def _find_amount_row(self):
         """Return the div.ljCEoY container element that contains the Amount/Сумма label.
@@ -573,28 +642,53 @@ class SeleniumWorker:
             self._stop_event.wait(POLL_INTERVAL)
 
     def _poll_once(self) -> None:
-        # --- Detect session expiry before doing anything ---
+        # --- Detect session expiry ---
         if self._is_on_login_page():
             logger.warning("Session expired (on login page), re-authenticating")
             self._re_authenticate()
             return
 
+        # --- Detect React error page (error boundary / server crash) ---
+        if self._is_error_page():
+            logger.warning("Error page detected before refresh — reloading orders page")
+            self._recover_from_error_page()
+            return
+
+        # --- Proactive filter check: re-apply if filter was lost ---
+        if not self._filter_applied and (self.min_amount is not None or self.max_amount is not None):
+            logger.warning("Filter not applied — re-applying before poll")
+            self._apply_amount_filter()
+
         # --- Refresh table ---
+        _full_reload = False
         try:
             refresh_btn = self._wait(5).until(EC.element_to_be_clickable(SEL_REFRESH_BUTTON))
             self._driver.execute_script("arguments[0].click();", refresh_btn)
             logger.debug("Refresh button clicked")
         except (NoSuchElementException, TimeoutException):
-            logger.debug("Refresh button not found, falling back to driver.get")
+            logger.warning("Refresh button not found — full page reload (will re-apply filter)")
+            self._filter_applied = False
             self._driver.get(self._orders_url)
+            _full_reload = True
 
-        # --- Detect session expiry after refresh (refresh may redirect to login) ---
+        # --- Post-refresh checks ---
         if self._is_on_login_page():
             logger.warning("Session expired after refresh, re-authenticating")
             self._re_authenticate()
             return
 
+        if self._is_error_page():
+            logger.warning("Error page detected after refresh — reloading")
+            self._recover_from_error_page()
+            return
+
         self._wait_for_table()
+
+        # --- Re-apply filter if full reload wiped React state ---
+        if _full_reload and (self.min_amount is not None or self.max_amount is not None):
+            logger.info("Re-applying amount filter after full page reload")
+            self._apply_amount_filter()
+
         rows = self._get_order_rows()
         if not rows:
             return
@@ -667,7 +761,23 @@ class SeleniumWorker:
 
             logger.info("Opening modal for order %s amount=%s", slug, amount)
             self._driver.execute_script("arguments[0].click();", anchor)
-            time.sleep(1.0)  # wait for modal open animation
+            time.sleep(1.0)  # wait for modal/page load animation
+
+            # Early error-page check — if the site returned an error while loading the
+            # order detail, bail out WITHOUT adding to _processed_slugs so the order
+            # can be retried after the recovery mechanism navigates back.
+            if self._is_error_page():
+                logger.warning(
+                    "Error page appeared after opening order %s — "
+                    "NOT marking as processed (will retry after page recovery)",
+                    slug,
+                )
+                return False
+
+            # Also guard against session expiry during modal open
+            if self._is_on_login_page():
+                logger.warning("Redirected to login while opening order %s modal", slug)
+                return False
 
             # Find "Взять"/"Take" button inside the modal (global search, any Russian/English variant)
             take_xpath = (
@@ -680,14 +790,21 @@ class SeleniumWorker:
                 "]"
             )
             try:
-                take_btn = self._wait(10).until(
+                take_btn = self._wait(15).until(
                     EC.element_to_be_clickable((By.XPATH, take_xpath))
                 )
             except TimeoutException:
+                # Check if it's a page error — if so, don't mark as processed
+                if self._is_error_page():
+                    logger.warning(
+                        "Error page detected while waiting for Take button (order %s) — "
+                        "NOT marking as processed (will retry after recovery)",
+                        slug,
+                    )
+                    return False
                 logger.warning("No Take button in modal for %s — already taken or not available", slug)
                 self._processed_slugs.add(slug)
                 # Close modal with Escape and stay on orders page
-                from selenium.webdriver.common.keys import Keys
                 self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
                 time.sleep(0.5)
                 return False
@@ -699,8 +816,6 @@ class SeleniumWorker:
             logger.info("Order %s taken successfully (amount=%s)", slug, amount)
             self._processed_slugs.add(slug)
             self._on_order_taken(slug, amount)
-            # After taking, the modal closes automatically; wait briefly then refresh
-            time.sleep(0.5)
             return True
 
         except NoAlertPresentException:
@@ -740,6 +855,10 @@ class SeleniumWorker:
             # Short-circuit if session expired mid-wait
             if self._is_on_login_page():
                 logger.warning("Redirected to login while waiting for table")
+                return
+            # Short-circuit if the site shows an error boundary page
+            if self._is_error_page():
+                logger.warning("Error page detected while waiting for table")
                 return
             try:
                 body = self._driver.find_element(*SEL_TABLE_BODY)

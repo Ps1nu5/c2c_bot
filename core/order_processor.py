@@ -69,6 +69,7 @@ class OrderProcessor:
         self._worker = SeleniumWorker(
             on_order_taken=self._on_taken,
             on_order_failed=self._on_failed,
+            on_startup_ok=self._on_startup,
             headless=HEADLESS,
         )
 
@@ -131,6 +132,28 @@ class OrderProcessor:
             await repo.update(is_active=value)
 
     # ── Callbacks called from the Selenium thread ────────────────────────────
+
+    def _on_startup(self, min_amount: Optional[float], max_amount: Optional[float]) -> None:
+        """Called once after the bot successfully logs in and applies filters.
+
+        Sends a single startup summary to all registered chats.
+        Not called on re-authentication cycles — only on initial startup.
+        """
+        if not self._chat_ids:
+            return
+        if min_amount is not None or max_amount is not None:
+            lo = f"{int(min_amount):,}" if min_amount is not None else "—"
+            hi = f"{int(max_amount):,}" if max_amount is not None else "—"
+            filter_line = f"Фильтр суммы: {lo} – {hi} RUB"
+        else:
+            filter_line = "Фильтр суммы: не задан"
+        text = (
+            "<b>Бот успешно запущен</b>\n\n"
+            "Страница заказов: открыта\n"
+            f"{filter_line}\n"
+            "Мониторинг новых ордеров начат"
+        )
+        _tg_send_sync(self._chat_ids, text)
 
     def _on_taken(self, slug: str, amount: Optional[float]) -> None:
         logger.info(
